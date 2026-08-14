@@ -1,0 +1,188 @@
+"""
+Owns Minecraft server (Java) subprocesses — one per server_id.
+
+Multi-server aware: each server on the VM gets its own entry in the
+in-memory registry, its own subprocess, and its own directory
+(config.ServerPaths). The manager also enforces the VM's concurrency
+cap (MAX_CONCURRENT_SERVERS) so at most vcpus-worth of servers can be
+RUNNING/STARTING at once — mirrors the rule the backend enforces before
+ever calling here, kept here too as defense in depth.
+
+This is still a plain in-memory singleton at the *registry* level (the
+agent process only lives as long as the VM does), it just now fans out
+per server_id instead of assuming a single server.
+"""
+import subprocess
+import time
+from enum import Enum
+from typing import Optional
+
+from config import ServerPaths, MAX_CONCURRENT_SERVERS
+
+
+class ServerState(str, Enum):
+    STOPPED = "stopped"
+    STARTING = "starting"
+    RUNNING = "running"
+    STOPPING = "stopping"
+    CRASHED = "crashed"
+
+
+class ConcurrencyLimitError(Exception):
+    pass
+
+
+class _ServerProcess:
+    """Tracks one server's subprocess + lifecycle state."""
+
+    def __init__(self, server_id: str):
+        self.paths = ServerPaths(server_id)
+        self._proc: Optional[subprocess.Popen] = None
+        self._state = ServerState.STOPPED
+        self._started_at: Optional[float] = None
+        self._last_error: Optional[str] = None
+
+    @property
+    def state(self) -> ServerState:
+        if self._state == ServerState.RUNNING and self._proc is not None:
+            if self._proc.poll() is not None:
+                self._state = ServerState.CRASHED
+        return self._state
+
+    @property
+    def uptime_seconds(self) -> Optional[int]:
+        if self._state != ServerState.RUNNING or self._started_at is None:
+            return None
+        return int(time.time() - self._started_at)
+
+    def _launch_command(self, xmx: str, xms: str) -> list[str]:
+        p = self.paths
+        if p.run_script.exists():
+            return ["bash", str(p.run_script), f"-Xmx{xmx}", f"-Xms{xms}", "nogui"]
+        if p.server_jar.exists():
+            return ["java", f"-Xmx{xmx}", f"-Xms{xms}", "-jar", str(p.server_jar), "nogui"]
+        raise FileNotFoundError(
+            "No launchable server found. Install a loader for this server "
+            "first (POST /servers/{id}/install/loader)."
+        )
+
+    def ensure_eula(self):
+        self.paths.eula_file.write_text("eula=true\n")
+
+    def start(self, xmx: str, xms: str):
+        if self.state == ServerState.RUNNING:
+            return
+        self.paths.ensure_dirs()
+        self.ensure_eula()
+        cmd = self._launch_command(xmx, xms)
+        self._state = ServerState.STARTING
+        self._last_error = None
+        try:
+            self._proc = subprocess.Popen(
+                cmd,
+                cwd=str(self.paths.root),
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                text=True,
+            )
+        except Exception as e:
+            self._state = ServerState.CRASHED
+            self._last_error = str(e)
+            raise
+        self._started_at = time.time()
+        self._state = ServerState.RUNNING
+
+    def stop(self, timeout: float = 30.0):
+        if self._proc is None or self.state not in (ServerState.RUNNING, ServerState.STARTING):
+            self._state = ServerState.STOPPED
+            return
+        self._state = ServerState.STOPPING
+        try:
+            if self._proc.stdin:
+                self._proc.stdin.write("stop\n")
+                self._proc.stdin.flush()
+            self._proc.wait(timeout=timeout)
+        except Exception:
+            self._proc.kill()
+        finally:
+            self._state = ServerState.STOPPED
+            self._proc = None
+            self._started_at = None
+
+    def send_command(self, command: str):
+        if self.state != ServerState.RUNNING or self._proc is None or self._proc.stdin is None:
+            raise RuntimeError("Server is not running")
+        self._proc.stdin.write(command.strip() + "\n")
+        self._proc.stdin.flush()
+
+    def tail_log(self, lines: int = 200) -> list[str]:
+        if not self.paths.latest_log.exists():
+            return []
+        with open(self.paths.latest_log, "r", errors="ignore") as f:
+            return f.readlines()[-lines:]
+
+
+class MultiServerManager:
+    """Registry of _ServerProcess instances, keyed by server_id."""
+
+    def __init__(self):
+        self._servers: dict[str, _ServerProcess] = {}
+
+    def _get_or_create(self, server_id: str) -> _ServerProcess:
+        if server_id not in self._servers:
+            self._servers[server_id] = _ServerProcess(server_id)
+        return self._servers[server_id]
+
+    def register(self, server_id: str) -> _ServerProcess:
+        """Called when a server is created — sets up its process tracker
+        and on-disk dirs without starting anything."""
+        sp = self._get_or_create(server_id)
+        sp.paths.ensure_dirs()
+        return sp
+
+    def forget(self, server_id: str):
+        """Called when a server is deleted. Refuses if still running —
+        caller should stop() first."""
+        sp = self._servers.get(server_id)
+        if sp and sp.state in (ServerState.RUNNING, ServerState.STARTING, ServerState.STOPPING):
+            raise RuntimeError("Stop the server before deleting it")
+        self._servers.pop(server_id, None)
+
+    def running_count(self) -> int:
+        return sum(
+            1
+            for sp in self._servers.values()
+            if sp.state in (ServerState.RUNNING, ServerState.STARTING)
+        )
+
+    def start(self, server_id: str, xmx: str, xms: str):
+        sp = self._get_or_create(server_id)
+        if sp.state not in (ServerState.RUNNING, ServerState.STARTING):
+            if self.running_count() >= MAX_CONCURRENT_SERVERS:
+                raise ConcurrencyLimitError(
+                    f"This VM can only run {MAX_CONCURRENT_SERVERS} server(s) "
+                    "at once. Stop another server first."
+                )
+        sp.start(xmx, xms)
+
+    def stop(self, server_id: str, timeout: float = 30.0):
+        self._get_or_create(server_id).stop(timeout)
+
+    def send_command(self, server_id: str, command: str):
+        self._get_or_create(server_id).send_command(command)
+
+    def tail_log(self, server_id: str, lines: int = 200) -> list[str]:
+        return self._get_or_create(server_id).tail_log(lines)
+
+    def state(self, server_id: str) -> ServerState:
+        return self._get_or_create(server_id).state
+
+    def uptime_seconds(self, server_id: str) -> Optional[int]:
+        return self._get_or_create(server_id).uptime_seconds
+
+    def paths(self, server_id: str) -> ServerPaths:
+        return self._get_or_create(server_id).paths
+
+
+manager = MultiServerManager()
