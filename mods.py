@@ -68,7 +68,14 @@ async def get_compatible_version(project_id: str, mc_version: str, loader: str) 
 
 async def install_from_modrinth(paths: ServerPaths, project_id: str, mc_version: str, loader: str) -> str:
     version = await get_compatible_version(project_id, mc_version, loader)
-    primary_file = next(f for f in version["files"] if f.get("primary", True))
+    # Not every Modrinth version has a file explicitly flagged primary
+    # (e.g. mods that only publish one file with primary=False, or a
+    # sources jar listed first) — next() with no default raises an
+    # unhandled StopIteration in that case. Fall back to the first file.
+    primary_file = next(
+        (f for f in version["files"] if f.get("primary", True)),
+        version["files"][0],
+    )
     paths.ensure_dirs()
     dest = paths.mods_dir / primary_file["filename"]
 
@@ -94,7 +101,14 @@ def list_installed_mods(paths: ServerPaths) -> list[dict]:
     if not paths.mods_dir.exists():
         return []
     return [
-        {"filename": p.name, "size_bytes": p.stat().st_size}
+        # sizeBytes is what the frontend (camelCase JSON) expects;
+        # size_bytes is kept alongside it for any other/older consumer
+        # of this endpoint that reads the snake_case form.
+        {
+            "filename": p.name,
+            "sizeBytes": p.stat().st_size,
+            "size_bytes": p.stat().st_size,
+        }
         for p in sorted(paths.mods_dir.glob("*.jar"))
     ]
 

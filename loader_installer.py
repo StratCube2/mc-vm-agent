@@ -40,6 +40,17 @@ async def list_mc_versions(release_only: bool = True) -> list[str]:
     return [v["id"] for v in versions]
 
 
+async def _get_version_manifest_entry(mc_version: str) -> dict:
+    async with httpx.AsyncClient(timeout=15) as client:
+        r = await client.get(MOJANG_MANIFEST)
+        r.raise_for_status()
+        data = r.json()
+    entry = next((v for v in data["versions"] if v["id"] == mc_version), None)
+    if entry is None:
+        raise InstallError(f"Unknown Minecraft version: {mc_version}")
+    return entry
+
+
 async def list_fabric_loader_versions() -> list[str]:
     async with httpx.AsyncClient(timeout=15) as client:
         r = await client.get(f"{FABRIC_META}/versions/loader")
@@ -57,6 +68,25 @@ async def _download(url: str, dest: Path) -> Path:
                 async for chunk in resp.aiter_bytes():
                     f.write(chunk)
     return dest
+
+
+async def install_vanilla(paths: ServerPaths, mc_version: str) -> None:
+    """Downloads the official Mojang server jar for mc_version straight
+    into server.jar — no installer step needed for vanilla."""
+    paths.ensure_dirs()
+    version_entry = await _get_version_manifest_entry(mc_version)
+
+    async with httpx.AsyncClient(timeout=15) as client:
+        r = await client.get(version_entry["url"])
+        r.raise_for_status()
+        version_meta = r.json()
+
+    server_download = version_meta.get("downloads", {}).get("server")
+    if not server_download:
+        raise InstallError(f"No server jar published for Minecraft {mc_version}")
+
+    paths.server_jar.unlink(missing_ok=True)
+    await _download(server_download["url"], paths.server_jar)
 
 
 async def install_fabric(paths: ServerPaths, mc_version: str, loader_version: str | None = None) -> None:
@@ -96,8 +126,11 @@ async def install_fabric(paths: ServerPaths, mc_version: str, loader_version: st
     launch_jar = paths.root / "fabric-server-launch.jar"
     if not launch_jar.exists():
         raise InstallError("Fabric install completed but launch jar not found")
-    if paths.server_jar.exists():
-        paths.server_jar.unlink()
+    # unlink(missing_ok=True) removes a regular file OR a broken symlink;
+    # server_jar.exists() would return False for a broken symlink (it
+    # follows the link to check the target), silently skipping removal
+    # and causing symlink_to() below to raise FileExistsError.
+    paths.server_jar.unlink(missing_ok=True)
     paths.server_jar.symlink_to(launch_jar)
 
 
@@ -142,6 +175,7 @@ async def install_neoforge(paths: ServerPaths, neoforge_version: str) -> None:
 
 
 LOADERS = {
+    "vanilla": install_vanilla,
     "fabric": install_fabric,
     "forge": install_forge,
     "neoforge": install_neoforge,

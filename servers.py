@@ -64,6 +64,12 @@ def create_server(name: str, loader: str, mc_version: str) -> dict:
         "name": name,
         "loader": loader,
         "mcVersion": mc_version,
+        # Tracks the binary-install step separately from ServerState
+        # (which is about the running process). A freshly created server
+        # has no server.jar/run.sh yet — installState lets the frontend
+        # show "Installing..." instead of a misleading crash-on-start.
+        "installState": "pending",
+        "installError": None,
     }
     _write_meta(server_id, meta)
     manager.register(server_id)
@@ -86,14 +92,31 @@ def list_servers() -> list[dict]:
     return [get_server(sid) for sid in list_server_ids()]
 
 
-def update_server_meta(server_id: str, loader: str | None = None, mc_version: str | None = None) -> dict:
+def update_server_meta(
+    server_id: str,
+    name: str | None = None,
+    loader: str | None = None,
+    mc_version: str | None = None,
+    install_state: str | None = None,
+    install_error: str | None = "__unset__",
+) -> dict:
     meta = _read_meta(server_id)
+    if name is not None:
+        meta["name"] = name
     if loader is not None:
         meta["loader"] = loader
     if mc_version is not None:
         meta["mcVersion"] = mc_version
+    if install_state is not None:
+        meta["installState"] = install_state
+    # install_error uses a sentinel default so callers can explicitly
+    # clear it (pass None) without every other caller having to repeat
+    # the current value just to avoid wiping it.
+    if install_error != "__unset__":
+        meta["installError"] = install_error
     _write_meta(server_id, meta)
     return meta
+
 
 
 def delete_server(server_id: str):

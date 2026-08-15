@@ -58,6 +58,7 @@ class CreateServerRequest(BaseModel):
     name: str
     loader: str
     mc_version: str
+    loader_version: str | None = None  # fabric loader version / forge & neoforge build; ignored for vanilla
 
 
 @authed.get("/servers")
@@ -65,12 +66,55 @@ def list_servers():
     return {"servers": servers_module.list_servers()}
 
 
+async def _run_install(server_id: str, loader: str, mc_version: str, loader_version: str | None):
+    """Runs the binary install for a freshly created server and records
+    the outcome on its meta.json. Called synchronously from
+    create_server (the frontend/backend already treat server creation as
+    a longer-running op — see e.g. VM provisioning's fire-and-forget
+    shape — but unlike that case, the caller here is directly waiting on
+    the HTTP response to know whether the server is actually usable, so
+    this is awaited rather than fired-and-forgotten)."""
+    paths = manager.paths(server_id)
+    servers_module.update_server_meta(server_id, install_state="installing")
+    try:
+        installer = loader_installer.LOADERS.get(loader)
+        if installer is None:
+            raise loader_installer.InstallError(f"Unknown loader: {loader}")
+        if loader == "vanilla":
+            await installer(paths, mc_version)
+        elif loader == "fabric":
+            await installer(paths, mc_version, loader_version)
+        elif loader == "forge":
+            if not loader_version:
+                raise loader_installer.InstallError("loader_version (forge build) required")
+            await installer(paths, mc_version, loader_version)
+        elif loader == "neoforge":
+            if not loader_version:
+                raise loader_installer.InstallError("loader_version (neoforge build) required")
+            await installer(paths, loader_version)
+        servers_module.update_server_meta(server_id, install_state="ready", install_error=None)
+    except Exception as e:
+        servers_module.update_server_meta(
+            server_id, install_state="failed", install_error=str(e)
+        )
+
+
 @authed.post("/servers")
-def create_server(req: CreateServerRequest):
+async def create_server(req: CreateServerRequest):
     try:
         meta = servers_module.create_server(req.name, req.loader, req.mc_version)
     except SlotLimitError as e:
         raise HTTPException(409, str(e))
+
+    # Install synchronously as part of server creation — previously
+    # create_server only wrote meta.json + directories and never
+    # downloaded a server jar at all, so every server's first start
+    # failed with FileNotFoundError. This makes creation take as long as
+    # the download+install (matches how the frontend already shows
+    # "Creating..." while awaiting this call), and the server comes back
+    # from this endpoint actually startable.
+    await _run_install(meta["id"], req.loader, req.mc_version, req.loader_version)
+
     return servers_module.get_server(meta["id"])
 
 
@@ -165,24 +209,58 @@ async def install_loader(server_id: str, req: InstallRequest):
         raise HTTPException(409, "Stop the server before changing loader/version")
 
     paths = manager.paths(server_id)
+    servers_module.update_server_meta(server_id, install_state="installing")
 
-    if req.loader == "fabric":
-        if not req.mc_version:
-            raise HTTPException(400, "mc_version required for fabric")
-        await loader_installer.install_fabric(paths, req.mc_version, req.loader_version)
-    elif req.loader == "forge":
-        if not req.mc_version or not req.loader_version:
-            raise HTTPException(400, "mc_version and loader_version (forge build) required")
-        await loader_installer.install_forge(paths, req.mc_version, req.loader_version)
-    elif req.loader == "neoforge":
-        if not req.loader_version:
-            raise HTTPException(400, "loader_version (neoforge build) required")
-        await loader_installer.install_neoforge(paths, req.loader_version)
-    else:
-        raise HTTPException(400, f"Unknown loader: {req.loader}")
+    try:
+        if req.loader == "vanilla":
+            if not req.mc_version:
+                raise HTTPException(400, "mc_version required for vanilla")
+            await loader_installer.install_vanilla(paths, req.mc_version)
+        elif req.loader == "fabric":
+            if not req.mc_version:
+                raise HTTPException(400, "mc_version required for fabric")
+            await loader_installer.install_fabric(paths, req.mc_version, req.loader_version)
+        elif req.loader == "forge":
+            if not req.mc_version or not req.loader_version:
+                raise HTTPException(400, "mc_version and loader_version (forge build) required")
+            await loader_installer.install_forge(paths, req.mc_version, req.loader_version)
+        elif req.loader == "neoforge":
+            if not req.loader_version:
+                raise HTTPException(400, "loader_version (neoforge build) required")
+            await loader_installer.install_neoforge(paths, req.loader_version)
+        else:
+            raise HTTPException(400, f"Unknown loader: {req.loader}")
+    except loader_installer.InstallError as e:
+        servers_module.update_server_meta(server_id, install_state="failed", install_error=str(e))
+        raise HTTPException(500, str(e))
+    except HTTPException:
+        servers_module.update_server_meta(server_id, install_state="failed", install_error="Invalid install request")
+        raise
 
-    servers_module.update_server_meta(server_id, loader=req.loader, mc_version=req.mc_version)
+    servers_module.update_server_meta(
+        server_id,
+        loader=req.loader,
+        mc_version=req.mc_version,
+        install_state="ready",
+        install_error=None,
+    )
     return {"ok": True, "loader": req.loader}
+
+
+# ---------- Server metadata (rename) ----------
+
+class UpdateServerRequest(BaseModel):
+    name: str
+
+
+@authed.patch("/servers/{server_id}")
+def rename_server(server_id: str, req: UpdateServerRequest):
+    get_server_or_404(server_id)
+    name = req.name.strip()
+    if not name:
+        raise HTTPException(400, "name cannot be empty")
+    servers_module.update_server_meta(server_id, name=name)
+    return servers_module.get_server(server_id)
 
 
 # ---------- Mods ----------

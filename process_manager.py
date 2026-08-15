@@ -55,10 +55,23 @@ class _ServerProcess:
             return None
         return int(time.time() - self._started_at)
 
+    def _write_user_jvm_args(self, xmx: str, xms: str):
+        """Forge/NeoForge's run.sh reads JVM flags from user_jvm_args.txt
+        in the server directory — it does NOT forward its own trailing
+        CLI args to the JVM. Passing -Xmx/-Xms as args to run.sh places
+        them after run.sh's internal `java @args.txt ... ` invocation,
+        so Java treats them as program arguments for Minecraft itself
+        rather than heap flags, leaving JVM memory unconfigured. Writing
+        them into user_jvm_args.txt is the mechanism Forge/NeoForge
+        actually support for this."""
+        args_file = self.paths.root / "user_jvm_args.txt"
+        args_file.write_text(f"-Xmx{xmx}\n-Xms{xms}\n")
+
     def _launch_command(self, xmx: str, xms: str) -> list[str]:
         p = self.paths
         if p.run_script.exists():
-            return ["bash", str(p.run_script), f"-Xmx{xmx}", f"-Xms{xms}", "nogui"]
+            self._write_user_jvm_args(xmx, xms)
+            return ["bash", str(p.run_script), "nogui"]
         if p.server_jar.exists():
             return ["java", f"-Xmx{xmx}", f"-Xms{xms}", "-jar", str(p.server_jar), "nogui"]
         raise FileNotFoundError(
