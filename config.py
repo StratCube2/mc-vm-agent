@@ -18,6 +18,7 @@ layout directly.
           run.sh | server.jar
           meta.json
 """
+import json
 import os
 from pathlib import Path
 
@@ -79,3 +80,48 @@ class ServerPaths:
             if p.is_file():
                 total += p.stat().st_size
         return round(total / (1024 ** 3), 2)
+
+    def read_meta(self) -> dict:
+        if not self.meta_file.exists():
+            return {}
+        return json.loads(self.meta_file.read_text())
+
+
+# Minecraft's required JDK jumped over time. Cutoffs below are the
+# earliest MC version (inclusive) that needs the given JDK; a version
+# uses the highest cutoff it meets. cloud-init installs all of these
+# side by side (see infra) — the agent just points `java` at the right
+# one per server, keyed off that server's own mc_version, since one VM
+# can host servers spanning multiple MC versions at once.
+JAVA_VERSION_CUTOFFS: list[tuple[tuple[int, ...], int]] = [
+    ((1, 21, 8), 25),
+    ((1, 20, 5), 21),
+    ((1, 18), 17),
+    ((0, 0, 0), 8),
+]
+DEFAULT_JAVA_VERSION = 21
+
+
+def _parse_mc_version(mc_version: str) -> tuple[int, ...] | None:
+    # Release versions only ("1.21.8"); snapshots/pre-releases etc. fall
+    # back to the default rather than guessing.
+    parts = mc_version.split(".")
+    if not all(p.isdigit() for p in parts):
+        return None
+    return tuple(int(p) for p in parts)
+
+
+def java_binary_for(mc_version: str | None) -> str:
+    """Resolves to a java executable path for the given MC version.
+    Falls back to the default JDK's `java` on PATH if mc_version is
+    missing/unparseable or a matching install can't be found on disk."""
+    if mc_version:
+        parsed = _parse_mc_version(mc_version)
+        if parsed is not None:
+            for cutoff, jdk in JAVA_VERSION_CUTOFFS:
+                if parsed >= cutoff:
+                    candidate = f"/usr/lib/jvm/java-{jdk}-openjdk-amd64/bin/java"
+                    if Path(candidate).exists():
+                        return candidate
+                    break
+    return "java"

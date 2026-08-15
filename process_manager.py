@@ -12,12 +12,14 @@ This is still a plain in-memory singleton at the *registry* level (the
 agent process only lives as long as the VM does), it just now fans out
 per server_id instead of assuming a single server.
 """
+import os
 import subprocess
 import time
 from enum import Enum
+from pathlib import Path
 from typing import Optional
 
-from config import ServerPaths, MAX_CONCURRENT_SERVERS
+from config import ServerPaths, MAX_CONCURRENT_SERVERS, java_binary_for
 
 
 class ServerState(str, Enum):
@@ -73,11 +75,19 @@ class _ServerProcess:
 
     def _launch_command(self, xmx: str, xms: str) -> list[str]:
         p = self.paths
+        mc_version = p.read_meta().get("mcVersion")
+        java = java_binary_for(mc_version)
         if p.run_script.exists():
             self._write_user_jvm_args(xmx, xms)
-            return ["bash", str(p.run_script), "nogui"]
+            # Forge/NeoForge's run.sh invokes its own bundled `java` call
+            # internally (via args.txt), so it doesn't take a java path
+            # as an argument — point it at the right JDK via PATH instead.
+            env_prefix = []
+            if java != "java":
+                env_prefix = ["env", f"PATH={Path(java).parent}:" + os.environ.get("PATH", "")]
+            return env_prefix + ["bash", str(p.run_script), "nogui"]
         if p.server_jar.exists():
-            return ["java", f"-Xmx{xmx}", f"-Xms{xms}", "-jar", str(p.server_jar), "nogui"]
+            return [java, f"-Xmx{xmx}", f"-Xms{xms}", "-jar", str(p.server_jar), "nogui"]
         raise FileNotFoundError(
             "No launchable server found. Install a loader for this server "
             "first (POST /servers/{id}/install/loader)."
