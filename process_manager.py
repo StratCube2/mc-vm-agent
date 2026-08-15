@@ -41,12 +41,16 @@ class _ServerProcess:
         self._state = ServerState.STOPPED
         self._started_at: Optional[float] = None
         self._last_error: Optional[str] = None
+        self._log_file = None
 
     @property
     def state(self) -> ServerState:
         if self._state == ServerState.RUNNING and self._proc is not None:
             if self._proc.poll() is not None:
                 self._state = ServerState.CRASHED
+                if self._log_file is not None:
+                    self._log_file.close()
+                    self._log_file = None
         return self._state
 
     @property
@@ -90,19 +94,28 @@ class _ServerProcess:
         cmd = self._launch_command(xmx, xms)
         self._state = ServerState.STARTING
         self._last_error = None
+        # Captures stdout/stderr to latest.log so launch-time failures
+        # (bad Java version, JVM crash before MC's own logger spins up,
+        # missing jar) are visible instead of silently discarded. MC's
+        # own logging (once JVM is up) will also write into logs/ via
+        # log4j, but that only starts *after* the JVM boots — this
+        # catches everything before and after in one place.
+        log_file = open(self.paths.latest_log, "a")
         try:
             self._proc = subprocess.Popen(
                 cmd,
                 cwd=str(self.paths.root),
                 stdin=subprocess.PIPE,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
                 text=True,
             )
         except Exception as e:
             self._state = ServerState.CRASHED
             self._last_error = str(e)
+            log_file.close()
             raise
+        self._log_file = log_file
         self._started_at = time.time()
         self._state = ServerState.RUNNING
 
@@ -122,6 +135,9 @@ class _ServerProcess:
             self._state = ServerState.STOPPED
             self._proc = None
             self._started_at = None
+            if self._log_file is not None:
+                self._log_file.close()
+                self._log_file = None
 
     def send_command(self, command: str):
         if self.state != ServerState.RUNNING or self._proc is None or self._proc.stdin is None:
