@@ -58,6 +58,19 @@ async def list_fabric_loader_versions() -> list[str]:
     return [v["version"] for v in r.json()]
 
 
+async def _latest_fabric_installer_version() -> str:
+    """Fabric installer versions are unrelated to loader versions and
+    change independently — pinning a literal string here goes stale
+    (or may never have been valid). Ask the meta API instead."""
+    async with httpx.AsyncClient(timeout=15) as client:
+        r = await client.get(f"{FABRIC_META}/versions/installer")
+        r.raise_for_status()
+    versions = r.json()
+    if not versions:
+        raise InstallError("Could not fetch Fabric installer versions")
+    return versions[0]["version"]  # latest stable is first
+
+
 async def _download(url: str, dest: Path) -> Path:
     dest.parent.mkdir(parents=True, exist_ok=True)
     async with httpx.AsyncClient(timeout=120, follow_redirects=True) as client:
@@ -67,7 +80,23 @@ async def _download(url: str, dest: Path) -> Path:
             with open(dest, "wb") as f:
                 async for chunk in resp.aiter_bytes():
                     f.write(chunk)
+    if dest.stat().st_size == 0:
+        dest.unlink(missing_ok=True)
+        raise InstallError(f"Download produced an empty file: {url}")
     return dest
+
+
+def _assert_valid_jar(path: Path) -> None:
+    """A failed/partial/HTML-error download can pass the HTTP status
+    check and still not be a real jar. Jars are zip files, which always
+    start with the 'PK' local-file-header signature — cheap way to catch
+    a corrupt/wrong download before wasting time running it."""
+    with open(path, "rb") as f:
+        header = f.read(2)
+    if header != b"PK":
+        raise InstallError(
+            f"{path.name} does not look like a valid jar (bad download?)"
+        )
 
 
 async def install_vanilla(paths: ServerPaths, mc_version: str) -> None:
@@ -97,15 +126,18 @@ async def install_fabric(paths: ServerPaths, mc_version: str, loader_version: st
             raise InstallError("Could not fetch Fabric loader versions")
         loader_version = versions[0]  # latest stable is first
 
-    # Fabric installer jar version — use a known-recent pin; agent doesn't
-    # need to track this closely since the installer itself pulls the
-    # actual loader/mc artifacts.
-    installer_version = "1.0.1"
+    # Fabric installer jar version — fetched from the meta API rather than
+    # pinned, since installer releases are independent of loader/mc
+    # versions and a stale/invalid pin here silently breaks the install
+    # (installer "succeeds" but produces a launch jar that can't find the
+    # game — the exact symptom of a bad/corrupt installer jar).
+    installer_version = await _latest_fabric_installer_version()
     installer_url = (
         f"{FABRIC_INSTALLER_MAVEN}/{installer_version}/"
         f"fabric-installer-{installer_version}.jar"
     )
     installer_jar = await _download(installer_url, paths.downloads_dir / "fabric-installer.jar")
+    _assert_valid_jar(installer_jar)
 
     result = subprocess.run(
         [
@@ -126,6 +158,20 @@ async def install_fabric(paths: ServerPaths, mc_version: str, loader_version: st
     launch_jar = paths.root / "fabric-server-launch.jar"
     if not launch_jar.exists():
         raise InstallError("Fabric install completed but launch jar not found")
+
+    # The launch jar is a thin wrapper — it needs the actual vanilla
+    # server jar (fetched via -downloadMinecraft) plus libraries/ next
+    # to it. If those are missing, the launch jar runs but throws
+    # exactly the "game provider couldn't locate the game" error you're
+    # debugging, with a successful-looking installer exit code.
+    libraries_dir = paths.root / "libraries"
+    if not libraries_dir.exists() or not any(libraries_dir.rglob("*.jar")):
+        raise InstallError(
+            "Fabric install completed but libraries/ is missing or empty — "
+            "the installer likely failed to download Minecraft itself "
+            "(check network access to launchermeta.mojang.com / "
+            "piston-data.mojang.com from the VM)"
+        )
     # unlink(missing_ok=True) removes a regular file OR a broken symlink;
     # server_jar.exists() would return False for a broken symlink (it
     # follows the link to check the target), silently skipping removal
