@@ -55,6 +55,12 @@ class ServerPaths:
         self.id = server_id
         self.root = SERVERS_ROOT / server_id
         self.mods_dir = self.root / "mods"
+        # Paper (and Bukkit/Spigot-family servers generally) load jars
+        # from plugins/, not mods/ — Fabric/Forge/NeoForge and Paper are
+        # never the same loader on the same server, so this is always
+        # unambiguous per-server. mods_dir stays the modding path for
+        # the JVM mod loaders; plugins_dir is Paper-only.
+        self.plugins_dir = self.root / "plugins"
         self.world_dir = self.root / "world"
         self.logs_dir = self.root / "logs"
         self.latest_log = self.logs_dir / "latest.log"
@@ -63,10 +69,11 @@ class ServerPaths:
         self.downloads_dir = self.root / ".downloads"
         self.run_script = self.root / "run.sh"
         self.server_jar = self.root / "server.jar"
+        self.pumpkin_bin = self.root / "pumpkin_server"
         self.meta_file = self.root / "meta.json"  # name, loader, mc_version
 
     def ensure_dirs(self):
-        for d in (self.root, self.mods_dir, self.world_dir, self.logs_dir, self.downloads_dir):
+        for d in (self.root, self.mods_dir, self.plugins_dir, self.world_dir, self.logs_dir, self.downloads_dir):
             d.mkdir(parents=True, exist_ok=True)
 
     def exists(self) -> bool:

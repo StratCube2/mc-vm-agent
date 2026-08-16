@@ -75,6 +75,12 @@ class _ServerProcess:
 
     def _launch_command(self, xmx: str, xms: str) -> list[str]:
         p = self.paths
+        # Pumpkin is a native binary, not a JVM app — no java, no
+        # -Xmx/-Xms (Pumpkin manages its own memory as a Rust process).
+        # Checked first since Pumpkin installs never leave a server_jar
+        # or run.sh behind (see loader_installer.install_pumpkin).
+        if p.pumpkin_bin.exists():
+            return [str(p.pumpkin_bin)]
         mc_version = p.read_meta().get("mcVersion")
         java = java_binary_for(mc_version)
         if p.run_script.exists():

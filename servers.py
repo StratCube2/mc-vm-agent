@@ -50,7 +50,7 @@ def list_server_ids() -> list[str]:
     )
 
 
-def create_server(name: str, loader: str, mc_version: str) -> dict:
+def create_server(name: str, loader: str, mc_version: str | None) -> dict:
     existing = list_server_ids()
     if len(existing) >= MAX_SERVER_SLOTS:
         raise SlotLimitError(
@@ -63,7 +63,10 @@ def create_server(name: str, loader: str, mc_version: str) -> dict:
         "id": server_id,
         "name": name,
         "loader": loader,
-        "mcVersion": mc_version,
+        # Pumpkin's nightly build always tracks the newest protocol
+        # version rather than being installed against a specific MC
+        # version, so mc_version is legitimately absent for it.
+        "mcVersion": mc_version or ("nightly" if loader == "pumpkin" else mc_version),
         # Tracks the binary-install step separately from ServerState
         # (which is about the running process). A freshly created server
         # has no server.jar/run.sh yet — installState lets the frontend

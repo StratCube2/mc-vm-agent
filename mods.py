@@ -1,15 +1,30 @@
 """
-Mod management, scoped per server via ServerPaths.
+Mod/plugin management, scoped per server via ServerPaths.
 
 Two install paths:
   1. Modrinth — search + install by project id/version (preferred)
   2. Raw jar upload — fallback for CurseForge-only mods or manual jars
+
+Directory depends on loader: Fabric/Forge/NeoForge load jars from
+mods/, while Paper (Bukkit/Spigot-family) loads jars from plugins/ —
+using the wrong directory means the jar is silently never loaded.
+Pumpkin has no Modrinth-distributed jar ecosystem at all yet, so it's
+excluded at the route layer in main.py rather than here.
 """
 import httpx
 from pathlib import Path
 from pydantic import BaseModel
 
 from config import MODRINTH_API, ServerPaths
+
+# Modrinth's `loaders` facet uses "paper" for Paper-compatible plugins,
+# which matches our own loader name 1:1 — no translation needed there,
+# just the directory differs.
+PAPER_LIKE_LOADERS = {"paper"}
+
+
+def target_dir(paths: ServerPaths, loader: str) -> Path:
+    return paths.plugins_dir if loader in PAPER_LIKE_LOADERS else paths.mods_dir
 
 
 class ModrinthResult(BaseModel):
@@ -77,7 +92,7 @@ async def install_from_modrinth(paths: ServerPaths, project_id: str, mc_version:
         version["files"][0],
     )
     paths.ensure_dirs()
-    dest = paths.mods_dir / primary_file["filename"]
+    dest = target_dir(paths, loader) / primary_file["filename"]
 
     async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
         r = await client.get(primary_file["url"])
@@ -87,18 +102,19 @@ async def install_from_modrinth(paths: ServerPaths, project_id: str, mc_version:
     return primary_file["filename"]
 
 
-def save_uploaded_jar(paths: ServerPaths, filename: str, content: bytes) -> str:
+def save_uploaded_jar(paths: ServerPaths, filename: str, content: bytes, loader: str) -> str:
     if not filename.lower().endswith(".jar"):
         raise ValueError("Only .jar files are accepted")
     paths.ensure_dirs()
     safe_name = Path(filename).name  # strip any path traversal
-    dest = paths.mods_dir / safe_name
+    dest = target_dir(paths, loader) / safe_name
     dest.write_bytes(content)
     return safe_name
 
 
-def list_installed_mods(paths: ServerPaths) -> list[dict]:
-    if not paths.mods_dir.exists():
+def list_installed_mods(paths: ServerPaths, loader: str) -> list[dict]:
+    d = target_dir(paths, loader)
+    if not d.exists():
         return []
     return [
         # sizeBytes is what the frontend (camelCase JSON) expects;
@@ -109,13 +125,13 @@ def list_installed_mods(paths: ServerPaths) -> list[dict]:
             "sizeBytes": p.stat().st_size,
             "size_bytes": p.stat().st_size,
         }
-        for p in sorted(paths.mods_dir.glob("*.jar"))
+        for p in sorted(d.glob("*.jar"))
     ]
 
 
-def remove_mod(paths: ServerPaths, filename: str) -> bool:
+def remove_mod(paths: ServerPaths, filename: str, loader: str) -> bool:
     safe_name = Path(filename).name
-    target = paths.mods_dir / safe_name
+    target = target_dir(paths, loader) / safe_name
     if target.exists() and target.suffix == ".jar":
         target.unlink()
         return True

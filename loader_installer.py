@@ -8,12 +8,17 @@ Each loader has a different install shape:
   - Forge:     download the forge installer for the exact forge build,
                run it with --installServer, produces run.sh/run.bat
   - NeoForge:  same shape as Forge (NeoForge is a Forge fork), produces run.sh
+  - Pumpkin:   download the prebuilt nightly binary straight from GitHub
+               Releases — no installer step, no JVM at all (Pumpkin is a
+               native Rust server implementation of the vanilla protocol).
 
-All installers are run with the VM's system Java, so Java itself must
-already be present (handled by the VM provisioning cloud-init, not here).
+All JVM-based installers are run with the VM's system Java, so Java
+itself must already be present (handled by the VM provisioning
+cloud-init, not here). Pumpkin needs no Java at all.
 """
 import httpx
 import subprocess
+import stat
 from pathlib import Path
 
 from config import ServerPaths
@@ -23,6 +28,20 @@ FABRIC_INSTALLER_MAVEN = "https://maven.fabricmc.net/net/fabricmc/fabric-install
 FORGE_MAVEN = "https://maven.minecraftforge.net/net/minecraftforge/forge"
 NEOFORGE_MAVEN = "https://maven.neoforged.net/releases/net/neoforged/neoforge"
 MOJANG_MANIFEST = "https://launchermeta.mojang.com/mc/game/version_manifest_v2.json"
+PAPER_FILL_API = "https://fill.papermc.io/v3/projects/paper"
+
+# Fill (PaperMC's downloads API) requires every request to send a
+# non-generic User-Agent identifying the calling software, or requests
+# are rejected outright — see https://docs.papermc.io/misc/downloads-service/
+PAPER_USER_AGENT = "PulseHost-mc-vm-agent/1.0 (+https://pulshost.netlify.app)"
+
+# Pumpkin ships prebuilt nightly binaries as GitHub release assets under
+# the fixed "nightly" tag (rolling — always the latest build). All Azure
+# VM sizes this platform provisions (Das_v4 / als_v2 / ats_v2) are x64,
+# so the Linux x64 asset is the only one ever relevant here.
+PUMPKIN_NIGHTLY_ASSET_URL = (
+    "https://github.com/Pumpkin-MC/Pumpkin/releases/download/nightly/pumpkin-X64-Linux"
+)
 
 
 class InstallError(Exception):
@@ -180,6 +199,35 @@ async def install_fabric(paths: ServerPaths, mc_version: str, loader_version: st
     paths.server_jar.symlink_to(launch_jar)
 
 
+async def install_paper(paths: ServerPaths, mc_version: str) -> None:
+    """Downloads the latest STABLE Paper build for mc_version straight
+    into server.jar via PaperMC's Fill v3 API — no installer step,
+    same launch shape as vanilla (plain `java -jar server.jar`)."""
+    paths.ensure_dirs()
+    headers = {"User-Agent": PAPER_USER_AGENT}
+
+    async with httpx.AsyncClient(timeout=15, headers=headers) as client:
+        r = await client.get(f"{PAPER_FILL_API}/versions/{mc_version}/builds")
+        if r.status_code == 404:
+            raise InstallError(f"Paper does not publish builds for Minecraft {mc_version}")
+        r.raise_for_status()
+        builds = r.json()
+
+    stable = next((b for b in builds if b.get("channel") == "STABLE"), None)
+    if stable is None:
+        raise InstallError(
+            f"No stable Paper build available for Minecraft {mc_version} yet "
+            "(Paper builds usually lag a few days behind a new MC release)"
+        )
+    download = stable.get("downloads", {}).get("server:default")
+    if not download or not download.get("url"):
+        raise InstallError(f"Paper build {stable.get('id')} has no server download listed")
+
+    paths.server_jar.unlink(missing_ok=True)
+    await _download(download["url"], paths.server_jar)
+    _assert_valid_jar(paths.server_jar)
+
+
 async def install_forge(paths: ServerPaths, mc_version: str, forge_version: str) -> None:
     """forge_version is the FULL forge build string, e.g. '20.1.0'
     (as published under the mc_version-forge_version maven path)."""
@@ -220,9 +268,41 @@ async def install_neoforge(paths: ServerPaths, neoforge_version: str) -> None:
         raise InstallError(f"NeoForge install failed:\n{result.stderr[-2000:]}")
 
 
+async def install_pumpkin(paths: ServerPaths) -> None:
+    """Downloads the latest Pumpkin nightly binary straight into
+    pumpkin_server (no installer, no Java, no mc_version — the nightly
+    tag is a rolling release and always targets the newest supported
+    protocol version). process_manager launches this directly as a
+    native executable instead of via `java -jar`."""
+    paths.ensure_dirs()
+    binary_path = paths.root / "pumpkin_server"
+    binary_path.unlink(missing_ok=True)
+    await _download(PUMPKIN_NIGHTLY_ASSET_URL, binary_path)
+
+    # Unlike jars, this is a raw ELF binary — sanity-check the ELF magic
+    # instead of the "PK" zip signature, and make sure it's executable
+    # (downloads land with default, non-executable permissions).
+    with open(binary_path, "rb") as f:
+        header = f.read(4)
+    if header != b"\x7fELF":
+        raise InstallError(
+            f"{binary_path.name} does not look like a valid binary (bad download?)"
+        )
+    binary_path.chmod(binary_path.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+
+    # Clear out any stale server_jar/run.sh from a previous loader so
+    # process_manager's launch-command detection doesn't pick the wrong
+    # one — Pumpkin has its own dedicated launch path (paths.pumpkin_bin).
+    paths.server_jar.unlink(missing_ok=True)
+    if paths.run_script.exists():
+        paths.run_script.unlink()
+
+
 LOADERS = {
     "vanilla": install_vanilla,
     "fabric": install_fabric,
     "forge": install_forge,
     "neoforge": install_neoforge,
+    "pumpkin": install_pumpkin,
+    "paper": install_paper,
 }

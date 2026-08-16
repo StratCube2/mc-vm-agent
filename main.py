@@ -57,8 +57,8 @@ def capacity():
 class CreateServerRequest(BaseModel):
     name: str
     loader: str
-    mc_version: str
-    loader_version: str | None = None  # fabric loader version / forge & neoforge build; ignored for vanilla
+    mc_version: str | None = None  # not required for pumpkin (nightly targets the newest protocol automatically)
+    loader_version: str | None = None  # fabric loader version / forge & neoforge build; ignored for vanilla/pumpkin
 
 
 @authed.get("/servers")
@@ -82,6 +82,8 @@ async def _run_install(server_id: str, loader: str, mc_version: str, loader_vers
             raise loader_installer.InstallError(f"Unknown loader: {loader}")
         if loader == "vanilla":
             await installer(paths, mc_version)
+        elif loader == "paper":
+            await installer(paths, mc_version)
         elif loader == "fabric":
             await installer(paths, mc_version, loader_version)
         elif loader == "forge":
@@ -92,6 +94,8 @@ async def _run_install(server_id: str, loader: str, mc_version: str, loader_vers
             if not loader_version:
                 raise loader_installer.InstallError("loader_version (neoforge build) required")
             await installer(paths, loader_version)
+        elif loader == "pumpkin":
+            await installer(paths)
         servers_module.update_server_meta(server_id, install_state="ready", install_error=None)
     except Exception as e:
         servers_module.update_server_meta(
@@ -216,6 +220,10 @@ async def install_loader(server_id: str, req: InstallRequest):
             if not req.mc_version:
                 raise HTTPException(400, "mc_version required for vanilla")
             await loader_installer.install_vanilla(paths, req.mc_version)
+        elif req.loader == "paper":
+            if not req.mc_version:
+                raise HTTPException(400, "mc_version required for paper")
+            await loader_installer.install_paper(paths, req.mc_version)
         elif req.loader == "fabric":
             if not req.mc_version:
                 raise HTTPException(400, "mc_version required for fabric")
@@ -228,6 +236,8 @@ async def install_loader(server_id: str, req: InstallRequest):
             if not req.loader_version:
                 raise HTTPException(400, "loader_version (neoforge build) required")
             await loader_installer.install_neoforge(paths, req.loader_version)
+        elif req.loader == "pumpkin":
+            await loader_installer.install_pumpkin(paths)
         else:
             raise HTTPException(400, f"Unknown loader: {req.loader}")
     except loader_installer.InstallError as e:
@@ -240,7 +250,7 @@ async def install_loader(server_id: str, req: InstallRequest):
     servers_module.update_server_meta(
         server_id,
         loader=req.loader,
-        mc_version=req.mc_version,
+        mc_version=req.mc_version or ("nightly" if req.loader == "pumpkin" else req.mc_version),
         install_state="ready",
         install_error=None,
     )
@@ -263,17 +273,27 @@ def rename_server(server_id: str, req: UpdateServerRequest):
     return servers_module.get_server(server_id)
 
 
-# ---------- Mods ----------
+# ---------- Mods / Plugins ----------
+# "mods" here covers Fabric/Forge/NeoForge mods AND Paper plugins —
+# mods_module.target_dir() picks mods/ vs plugins/ based on loader.
+# Pumpkin has no Modrinth-distributed jar ecosystem, so its routes 409.
+
+def _require_moddable(server_id: str) -> dict:
+    server = get_server_or_404(server_id)
+    if server["loader"] == "pumpkin":
+        raise HTTPException(409, "Pumpkin does not support Modrinth mods/plugins yet")
+    return server
+
 
 @authed.get("/servers/{server_id}/mods")
 def list_mods(server_id: str):
-    get_server_or_404(server_id)
-    return {"mods": mods_module.list_installed_mods(manager.paths(server_id))}
+    server = _require_moddable(server_id)
+    return {"mods": mods_module.list_installed_mods(manager.paths(server_id), server["loader"])}
 
 
 @authed.get("/servers/{server_id}/mods/search")
 async def search_mods(server_id: str, q: str, mc_version: str | None = None, loader: str | None = None):
-    get_server_or_404(server_id)
+    _require_moddable(server_id)
     results = await mods_module.search_modrinth(q, mc_version, loader)
     return {"results": [r.model_dump() for r in results]}
 
@@ -286,7 +306,7 @@ class ModInstallRequest(BaseModel):
 
 @authed.post("/servers/{server_id}/mods/install")
 async def install_mod(server_id: str, req: ModInstallRequest):
-    get_server_or_404(server_id)
+    _require_moddable(server_id)
     try:
         filename = await mods_module.install_from_modrinth(
             manager.paths(server_id), req.project_id, req.mc_version, req.loader
@@ -298,10 +318,10 @@ async def install_mod(server_id: str, req: ModInstallRequest):
 
 @authed.post("/servers/{server_id}/mods/upload")
 async def upload_mod(server_id: str, file: UploadFile = File(...)):
-    get_server_or_404(server_id)
+    server = _require_moddable(server_id)
     content = await file.read()
     try:
-        filename = mods_module.save_uploaded_jar(manager.paths(server_id), file.filename, content)
+        filename = mods_module.save_uploaded_jar(manager.paths(server_id), file.filename, content, server["loader"])
     except ValueError as e:
         raise HTTPException(400, str(e))
     return {"ok": True, "filename": filename}
@@ -309,8 +329,8 @@ async def upload_mod(server_id: str, file: UploadFile = File(...)):
 
 @authed.delete("/servers/{server_id}/mods/{filename}")
 def delete_mod(server_id: str, filename: str):
-    get_server_or_404(server_id)
-    if mods_module.remove_mod(manager.paths(server_id), filename):
+    server = _require_moddable(server_id)
+    if mods_module.remove_mod(manager.paths(server_id), filename, server["loader"]):
         return {"ok": True}
     raise HTTPException(404, "Mod not found")
 
