@@ -11,6 +11,7 @@ MAX_SERVER_SLOTS (storage_gb / 8), and run up to MAX_CONCURRENT_SERVERS
 Run: uvicorn main:app --host 0.0.0.0 --port 8443
 """
 from fastapi import FastAPI, APIRouter, Depends, HTTPException, UploadFile, File, Form
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 from auth import require_agent_token
@@ -21,6 +22,8 @@ from servers import SlotLimitError, ServerNotFoundError
 import loader_installer
 import mods as mods_module
 import properties as props_module
+import files as files_module
+import mrpack_installer
 
 app = FastAPI(title="MC VM Agent")
 authed = APIRouter(dependencies=[Depends(require_agent_token)])
@@ -347,6 +350,141 @@ def get_properties(server_id: str):
 def update_properties(server_id: str, updates: dict[str, str]):
     get_server_or_404(server_id)
     return props_module.write_properties(manager.paths(server_id), updates)
+
+
+# ---------- File explorer / editor ----------
+# Every route here is scoped to a single server's own directory
+# (ServerPaths.root) via files_module._resolve — a client-supplied
+# path can never reach outside it. See files.py's module docstring.
+
+def _files_error(server_id: str, e: Exception):
+    if isinstance(e, files_module.NotFoundError):
+        raise HTTPException(404, f"Not found: {e}")
+    if isinstance(e, files_module.PathEscapeError):
+        raise HTTPException(400, str(e))
+    if isinstance(e, files_module.NotADirectoryErr):
+        raise HTTPException(400, f"Not a directory: {e}")
+    if isinstance(e, files_module.IsADirectoryErr):
+        raise HTTPException(400, f"Is a directory: {e}")
+    if isinstance(e, files_module.BinaryFileError):
+        raise HTTPException(415, str(e))
+    if isinstance(e, files_module.FileTooLargeError):
+        raise HTTPException(413, str(e))
+    if isinstance(e, files_module.ProtectedPathError):
+        raise HTTPException(409, str(e))
+    if isinstance(e, files_module.AlreadyExistsError):
+        raise HTTPException(409, f"Already exists: {e}")
+    raise HTTPException(500, str(e))
+
+
+@authed.get("/servers/{server_id}/files")
+def list_files(server_id: str, path: str = ""):
+    get_server_or_404(server_id)
+    try:
+        entries = files_module.list_dir(manager.paths(server_id), path)
+    except Exception as e:
+        _files_error(server_id, e)
+    return {"entries": [e.model_dump() for e in entries]}
+
+
+@authed.get("/servers/{server_id}/files/content")
+def read_file(server_id: str, path: str):
+    get_server_or_404(server_id)
+    try:
+        return files_module.read_text_file(manager.paths(server_id), path)
+    except Exception as e:
+        _files_error(server_id, e)
+
+
+class WriteFileRequest(BaseModel):
+    path: str
+    content: str
+
+
+@authed.put("/servers/{server_id}/files/content")
+def write_file(server_id: str, req: WriteFileRequest):
+    get_server_or_404(server_id)
+    try:
+        return files_module.write_text_file(manager.paths(server_id), req.path, req.content)
+    except Exception as e:
+        _files_error(server_id, e)
+
+
+class MkdirRequest(BaseModel):
+    path: str
+
+
+@authed.post("/servers/{server_id}/files/mkdir")
+def make_dir(server_id: str, req: MkdirRequest):
+    get_server_or_404(server_id)
+    try:
+        return files_module.mkdir(manager.paths(server_id), req.path)
+    except Exception as e:
+        _files_error(server_id, e)
+
+
+class RenameFileRequest(BaseModel):
+    path: str
+    newPath: str
+
+
+@authed.post("/servers/{server_id}/files/rename")
+def rename_file(server_id: str, req: RenameFileRequest):
+    get_server_or_404(server_id)
+    try:
+        return files_module.rename_path(manager.paths(server_id), req.path, req.newPath)
+    except Exception as e:
+        _files_error(server_id, e)
+
+
+@authed.delete("/servers/{server_id}/files")
+def delete_file(server_id: str, path: str):
+    get_server_or_404(server_id)
+    try:
+        files_module.delete_path(manager.paths(server_id), path)
+    except Exception as e:
+        _files_error(server_id, e)
+    return {"ok": True}
+
+
+@authed.post("/servers/{server_id}/files/upload")
+async def upload_file(server_id: str, path: str = Form(default=""), file: UploadFile = File(...)):
+    get_server_or_404(server_id)
+    content = await file.read()
+    try:
+        return files_module.save_uploaded_file(manager.paths(server_id), path, file.filename, content)
+    except Exception as e:
+        _files_error(server_id, e)
+
+
+@authed.get("/servers/{server_id}/files/download")
+def download_file(server_id: str, path: str):
+    get_server_or_404(server_id)
+    try:
+        target = files_module.resolve_for_download(manager.paths(server_id), path)
+    except Exception as e:
+        _files_error(server_id, e)
+    return FileResponse(target, filename=target.name, media_type="application/octet-stream")
+
+
+# ---------- .mrpack (Modrinth modpack) install ----------
+
+@authed.post("/servers/{server_id}/mrpack/install")
+async def install_mrpack(server_id: str, file: UploadFile = File(...)):
+    server = get_server_or_404(server_id)
+    if server["loader"] == "pumpkin":
+        raise HTTPException(409, "Pumpkin does not support Modrinth modpacks yet")
+    if manager.state(server_id).value == "running":
+        raise HTTPException(409, "Stop the server before installing a modpack")
+
+    content = await file.read()
+    try:
+        result = await mrpack_installer.install_mrpack(
+            manager.paths(server_id), content, server["loader"]
+        )
+    except mrpack_installer.MrpackError as e:
+        raise HTTPException(400, str(e))
+    return result.model_dump()
 
 
 app.include_router(authed)
