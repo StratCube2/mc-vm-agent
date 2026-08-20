@@ -96,12 +96,52 @@ async def _download(url: str, dest: Path) -> Path:
         async with client.stream("GET", url) as resp:
             if resp.status_code != 200:
                 raise InstallError(f"Download failed ({resp.status_code}): {url}")
+            # CDN error bodies (e.g. S3 "Access Denied" XML) are often
+            # served with a 200/206 and a small content-length, but never
+            # claim to be a jar/binary — checking content-type here catches
+            # them before we even write bytes to disk. Some CDNs omit this
+            # header entirely, so a missing header is not itself an error;
+            # only an explicit non-binary type (text/html, text/xml,
+            # application/json, application/xml) is treated as a red flag.
+            content_type = resp.headers.get("content-type", "").split(";")[0].strip().lower()
+            if content_type in (
+                "text/html", "text/xml", "text/plain",
+                "application/json", "application/xml",
+            ):
+                # Drain a small amount for a more useful error message,
+                # then bail without writing a bad file to disk.
+                body_preview = b""
+                async for chunk in resp.aiter_bytes():
+                    body_preview += chunk
+                    if len(body_preview) >= 500:
+                        break
+                raise InstallError(
+                    f"Download returned {content_type} instead of a binary file "
+                    f"(likely an error page): {url}\n{body_preview[:500]!r}"
+                )
             with open(dest, "wb") as f:
                 async for chunk in resp.aiter_bytes():
                     f.write(chunk)
-    if dest.stat().st_size == 0:
+    size = dest.stat().st_size
+    if size == 0:
         dest.unlink(missing_ok=True)
         raise InstallError(f"Download produced an empty file: {url}")
+    # A real server jar/installer/binary is always well over a few KB.
+    # Error bodies (rate-limit pages, CDN "Access Denied" XML, etc.) are
+    # almost always well under that, and can slip past the status-code
+    # and content-type checks above (e.g. served as 200 with a generic
+    # or missing content-type). Catching this here, before the
+    # per-format signature checks, gives a much clearer error message
+    # than "not a valid jar" and covers formats with no signature check
+    # at all.
+    if size < 10_000:
+        with open(dest, "rb") as f:
+            preview = f.read(500)
+        dest.unlink(missing_ok=True)
+        raise InstallError(
+            f"Download suspiciously small ({size} bytes), likely an error "
+            f"response, not a real file: {url}\n{preview!r}"
+        )
     return dest
 
 
@@ -135,6 +175,7 @@ async def install_vanilla(paths: ServerPaths, mc_version: str) -> None:
 
     paths.server_jar.unlink(missing_ok=True)
     await _download(server_download["url"], paths.server_jar)
+    _assert_valid_jar(paths.server_jar)
 
 
 async def install_fabric(paths: ServerPaths, mc_version: str, loader_version: str | None = None) -> None:
