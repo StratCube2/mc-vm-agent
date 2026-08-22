@@ -17,17 +17,20 @@ itself must already be present (handled by the VM provisioning
 cloud-init, not here). Pumpkin needs no Java at all.
 """
 import httpx
+import logging
 import subprocess
 import stat
 from pathlib import Path
 
 from config import ServerPaths
 
+logger = logging.getLogger(__name__)
+
 FABRIC_META = "https://meta.fabricmc.net/v2"
 FABRIC_INSTALLER_MAVEN = "https://maven.fabricmc.net/net/fabricmc/fabric-installer"
 FORGE_MAVEN = "https://maven.minecraftforge.net/net/minecraftforge/forge"
 NEOFORGE_MAVEN = "https://maven.neoforged.net/releases/net/neoforged/neoforge"
-MOJANG_MANIFEST = "https://launchermeta.mojang.com/mc/game/version_manifest_v2.json"
+MOJANG_MANIFEST = "https://launchermeta.mojang.com/mc/game/version_manifest.json"
 PAPER_FILL_API = "https://fill.papermc.io/v3/projects/paper"
 
 # Fill (PaperMC's downloads API) requires every request to send a
@@ -163,6 +166,7 @@ async def install_vanilla(paths: ServerPaths, mc_version: str) -> None:
     into server.jar — no installer step needed for vanilla."""
     paths.ensure_dirs()
     version_entry = await _get_version_manifest_entry(mc_version)
+    logger.info("vanilla install: per-version metadata URL = %s", version_entry.get("url"))
 
     async with httpx.AsyncClient(timeout=15) as client:
         r = await client.get(version_entry["url"])
@@ -173,8 +177,28 @@ async def install_vanilla(paths: ServerPaths, mc_version: str) -> None:
     if not server_download:
         raise InstallError(f"No server jar published for Minecraft {mc_version}")
 
+    logger.info(
+        "vanilla install: server jar URL = %s (expected size %s bytes)",
+        server_download.get("url"), server_download.get("size"),
+    )
+
     paths.server_jar.unlink(missing_ok=True)
     await _download(server_download["url"], paths.server_jar)
+
+    actual_size = paths.server_jar.stat().st_size
+    expected_size = server_download.get("size")
+    if expected_size and actual_size != expected_size:
+        bad_bytes = paths.server_jar.read_bytes()[:500]
+        paths.server_jar.unlink(missing_ok=True)
+        raise InstallError(
+            f"server.jar size mismatch: got {actual_size} bytes, "
+            f"Mojang manifest says it should be {expected_size} bytes. "
+            f"This means the download was intercepted or truncated "
+            f"(e.g. blocked by the VM's outbound network/firewall/DNS, "
+            f"or a captive proxy returning an error page). "
+            f"Response preview: {bad_bytes!r}"
+        )
+
     _assert_valid_jar(paths.server_jar)
 
 
