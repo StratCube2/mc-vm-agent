@@ -28,9 +28,15 @@ from config import ServerPaths
 MAX_TEXT_FILE_BYTES = 5 * 1024 * 1024  # 5 MiB
 
 # Directories nobody should be able to rm -rf or rename via the file
-# explorer — they're structural, not "files" in the user's mental model,
-# and process_manager/loader_installer assume they exist.
-PROTECTED_ROOT_NAMES = {"world", "mods", "plugins", "logs"}
+# explorer. Previously this also included "world", "mods", "plugins",
+# and "logs" — but for a hardcore server, deleting/recreating "world"
+# (or the nether/end dims) after a death is a normal, desired action,
+# and blocking it here meant a manual SSH-in was the only way to reset.
+# Those four now recreate themselves as needed (ensure_dirs() on
+# start/register, install routines re-mkdir mods/plugins, logging just
+# re-mkdirs logs/) so deleting them from the explorer is safe. Only the
+# server root itself remains truly structural — see _check_not_protected.
+PROTECTED_ROOT_NAMES: set[str] = set()
 
 
 class PathEscapeError(Exception):
@@ -252,3 +258,4 @@ def resolve_for_download(paths: ServerPaths, rel_path: str) -> Path:
     if target.is_dir():
         raise IsADirectoryErr(rel_path)
     return target
+    
