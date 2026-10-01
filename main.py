@@ -5,8 +5,10 @@ directly by a browser.
 
 Multi-server aware: every server-scoped route is namespaced under
 /servers/{server_id}/... A VM can host multiple servers up to
-MAX_SERVER_SLOTS (storage_gb / 8), and run up to MAX_CONCURRENT_SERVERS
-(= vcpus) of them at once — both enforced here as well as by the backend.
+MAX_SERVER_SLOTS (storage_gb / 8), and run a configurable number of them
+at once — the backend passes its per-VM concurrent-server limit on every
+start request, and MAX_CONCURRENT_SERVERS is just the fallback default.
+Both limits are enforced here as well as by the backend.
 
 Run: uvicorn main:app --host 0.0.0.0 --port 8443
 """
@@ -24,9 +26,23 @@ import mods as mods_module
 import properties as props_module
 import files as files_module
 import mrpack_installer
+import monitor
+import worlds as worlds_module
+import backup as backup_module
 
 app = FastAPI(title="MC VM Agent")
 authed = APIRouter(dependencies=[Depends(require_agent_token)])
+
+
+@app.on_event("startup")
+def _start_monitoring() -> None:
+    """Runs on every agent process start — VM boot via systemd, manual
+    restarts, and crash-recovery (Restart=always) — so the metric report
+    loop is always live while the VM is up. No-op push-wise if
+    MC_REPORT_URL isn't configured; the backend then pulls /metrics
+    itself."""
+    started = monitor.start_report_loop()
+    print(f"[monitor] report loop {'started (pushing to ' + monitor.REPORT_URL + ')' if started else 'not configured — backend will pull /metrics'}")
 
 
 @app.get("/health")
@@ -34,6 +50,13 @@ def health():
     """Unauthenticated so Render/uptime checks can confirm the agent is
     reachable even before/independent of token setup."""
     return {"ok": True}
+
+
+@authed.get("/metrics")
+def get_metrics():
+    """On-demand snapshot of this VM's monitoring data — the fallback
+    path used by the backend when no pushed report is fresh yet."""
+    return monitor.collect()
 
 
 def get_server_or_404(server_id: str) -> dict:
@@ -62,6 +85,7 @@ class CreateServerRequest(BaseModel):
     loader: str
     mc_version: str | None = None  # not required for pumpkin (nightly targets the newest protocol automatically)
     loader_version: str | None = None  # fabric loader version / forge & neoforge build; ignored for vanilla/pumpkin
+    server_port: int | None = None  # port assigned by the backend; written to server.properties before first boot
 
 
 @authed.get("/servers")
@@ -109,9 +133,11 @@ async def _run_install(server_id: str, loader: str, mc_version: str, loader_vers
 @authed.post("/servers")
 async def create_server(req: CreateServerRequest):
     try:
-        meta = servers_module.create_server(req.name, req.loader, req.mc_version)
+        meta = servers_module.create_server(req.name, req.loader, req.mc_version, req.server_port)
     except SlotLimitError as e:
         raise HTTPException(409, str(e))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
 
     # Install synchronously as part of server creation — previously
     # create_server only wrote meta.json + directories and never
@@ -140,18 +166,43 @@ def delete_server(server_id: str):
     return {"ok": True}
 
 
+# ---------- Server network config ----------
+
+class NetworkConfigRequest(BaseModel):
+    server_port: int
+
+
+@authed.post("/servers/{server_id}/network")
+def set_network(server_id: str, req: NetworkConfigRequest):
+    """(Re)applies the backend-assigned port: updates meta.json + the
+    server-port line of server.properties. Refuses while running — the
+    JVM only reads the port at boot."""
+    get_server_or_404(server_id)
+    try:
+        servers_module.set_server_port(server_id, req.server_port)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except RuntimeError as e:
+        raise HTTPException(409, str(e))
+    return {"ok": True, "serverPort": req.server_port}
+
+
 # ---------- Server process control ----------
 
 class StartRequest(BaseModel):
     xmx: str = DEFAULT_XMX
     xms: str = DEFAULT_XMS
+    # The backend's authoritative per-VM concurrent-server limit, passed
+    # on every start so enforcement here matches the user's configured
+    # value rather than the old static vCPU-derived one.
+    concurrent_limit: int | None = None
 
 
 @authed.post("/servers/{server_id}/start")
 def start_server(server_id: str, req: StartRequest):
     get_server_or_404(server_id)
     try:
-        manager.start(server_id, req.xmx, req.xms)
+        manager.start(server_id, req.xmx, req.xms, req.concurrent_limit)
     except FileNotFoundError as e:
         raise HTTPException(400, str(e))
     except ConcurrencyLimitError as e:
@@ -258,6 +309,51 @@ async def install_loader(server_id: str, req: InstallRequest):
         install_error=None,
     )
     return {"ok": True, "loader": req.loader}
+
+
+# ---------- Worlds / dimension reset ----------
+
+@authed.get("/servers/{server_id}/worlds")
+def get_worlds(server_id: str):
+    get_server_or_404(server_id)
+    return worlds_module.get_world_info(server_id)
+
+
+class WorldResetRequest(BaseModel):
+    dimensions: list[str]  # subset of: overworld, nether, end
+    seed: str | None = None  # None/empty -> Minecraft picks a random seed
+
+
+@authed.post("/servers/{server_id}/worlds/reset")
+def reset_worlds(server_id: str, req: WorldResetRequest):
+    """Permanently deletes the selected dimension data and applies the
+    given seed for the next start. Refuses while the server is up —
+    the backend checks this too, this is defense in depth."""
+    get_server_or_404(server_id)
+    if not req.dimensions:
+        raise HTTPException(400, "Select at least one dimension to reset")
+    try:
+        return worlds_module.reset_worlds(server_id, req.dimensions, req.seed)
+    except worlds_module.WorldResetError as e:
+        raise HTTPException(409, str(e))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+# ---------- Backups (.zip downloads) ----------
+
+@authed.get("/servers/{server_id}/backup")
+def backup_server(server_id: str):
+    """Whole server directory as a streamed .zip. Hot backups are allowed;
+    the caller warns that a running world may not zip fully consistently."""
+    server = get_server_or_404(server_id)
+    return backup_module.backup_response(server_id, server.get("name", server_id))
+
+
+@authed.get("/vm/backup")
+def backup_vm():
+    """Every server on this VM in one .zip, each under its own folder."""
+    return backup_module.vm_backup_response()
 
 
 # ---------- Server metadata (rename) ----------

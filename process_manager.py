@@ -46,6 +46,11 @@ class _ServerProcess:
         self._log_file = None
 
     @property
+    def proc(self) -> Optional[subprocess.Popen]:
+        """Read-only handle for monitoring (per-process CPU/RAM reads)."""
+        return self._proc
+
+    @property
     def state(self) -> ServerState:
         if self._state == ServerState.RUNNING and self._proc is not None:
             if self._proc.poll() is not None:
@@ -201,13 +206,19 @@ class MultiServerManager:
             if sp.state in (ServerState.RUNNING, ServerState.STARTING)
         )
 
-    def start(self, server_id: str, xmx: str, xms: str):
+    def start(self, server_id: str, xmx: str, xms: str, concurrent_limit: int | None = None):
+        """Starts the server's process. `concurrent_limit` is the backend's
+        authoritative per-VM setting passed through on each start — the old
+        hardcoded MAX_CONCURRENT_SERVERS (= vcpus) assumption is gone; the
+        user configures this per VM. Falls back to the env default if the
+        caller doesn't supply one."""
         sp = self._get_or_create(server_id)
         if sp.state not in (ServerState.RUNNING, ServerState.STARTING):
-            if self.running_count() >= MAX_CONCURRENT_SERVERS:
+            limit = max(1, concurrent_limit) if concurrent_limit else MAX_CONCURRENT_SERVERS
+            if self.running_count() >= limit:
                 raise ConcurrencyLimitError(
-                    f"This VM can only run {MAX_CONCURRENT_SERVERS} server(s) "
-                    "at once. Stop another server first."
+                    f"Concurrent server limit reached ({self.running_count()}/{limit}). "
+                    "Stop another server before starting this server."
                 )
         sp.start(xmx, xms)
 
@@ -228,6 +239,15 @@ class MultiServerManager:
 
     def paths(self, server_id: str) -> ServerPaths:
         return self._get_or_create(server_id).paths
+
+    def raw_process(self, server_id: str) -> Optional[subprocess.Popen]:
+        """The live Popen for a server, if it has one — used by the
+        monitoring collector to read per-process CPU/RAM. Returns None
+        when the server isn't running."""
+        sp = self._servers.get(server_id)
+        if sp is None:
+            return None
+        return sp.proc
 
 
 manager = MultiServerManager()

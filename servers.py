@@ -15,6 +15,7 @@ from pathlib import Path
 
 from config import SERVERS_ROOT, MAX_SERVER_SLOTS, ServerPaths
 from process_manager import manager, ServerState
+import properties as props_module
 
 
 class SlotLimitError(Exception):
@@ -50,13 +51,18 @@ def list_server_ids() -> list[str]:
     )
 
 
-def create_server(name: str, loader: str, mc_version: str | None) -> dict:
+def create_server(
+    name: str, loader: str, mc_version: str | None, server_port: int | None = None
+) -> dict:
     existing = list_server_ids()
     if len(existing) >= MAX_SERVER_SLOTS:
         raise SlotLimitError(
             f"This VM has room for {MAX_SERVER_SLOTS} server(s) "
             f"(storage_gb / 8). Delete one first to make room."
         )
+
+    if server_port is not None and not (1024 <= server_port <= 65535):
+        raise ValueError(f"Invalid server port: {server_port}")
 
     server_id = uuid.uuid4().hex[:12]
     meta = {
@@ -73,10 +79,31 @@ def create_server(name: str, loader: str, mc_version: str | None) -> dict:
         # show "Installing..." instead of a misleading crash-on-start.
         "installState": "pending",
         "installError": None,
+        # Port assigned by the backend (sequential from the VM's starting
+        # port). Mirrored here so the agent can re-apply server-port after
+        # a properties file is regenerated, but the backend DB row is
+        # authoritative for allocation.
+        "serverPort": server_port,
     }
     _write_meta(server_id, meta)
     manager.register(server_id)
+
+    if server_port is not None:
+        props_module.write_properties(manager.paths(server_id), {"server-port": str(server_port)})
     return meta
+
+
+def set_server_port(server_id: str, port: int) -> dict:
+    """(Re)applies this server's assigned port — updates meta.json and the
+    server-port line of server.properties without touching other keys."""
+    if not (1024 <= port <= 65535):
+        raise ValueError(f"Invalid server port: {port}")
+    meta = _read_meta(server_id)
+    state = manager.state(server_id)
+    if state in (ServerState.RUNNING, ServerState.STARTING):
+        raise RuntimeError("Stop the server before changing its port")
+    props_module.write_properties(manager.paths(server_id), {"server-port": str(port)})
+    return update_server_meta(server_id, server_port=port)
 
 
 def get_server(server_id: str) -> dict:
@@ -102,6 +129,7 @@ def update_server_meta(
     mc_version: str | None = None,
     install_state: str | None = None,
     install_error: str | None = "__unset__",
+    server_port: int | None = None,
 ) -> dict:
     meta = _read_meta(server_id)
     if name is not None:
@@ -117,6 +145,8 @@ def update_server_meta(
     # the current value just to avoid wiping it.
     if install_error != "__unset__":
         meta["installError"] = install_error
+    if server_port is not None:
+        meta["serverPort"] = server_port
     _write_meta(server_id, meta)
     return meta
 

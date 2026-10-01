@@ -34,8 +34,30 @@ def read_properties(paths: ServerPaths) -> dict[str, str]:
 
 def write_properties(paths: ServerPaths, updates: dict[str, str]) -> dict[str, str]:
     paths.ensure_dirs()
-    current = read_properties(paths)
+    if paths.properties_file.exists():
+        current = read_properties(paths)
+    else:
+        # File doesn't exist yet (server never booted). Write ONLY the
+        # requested keys rather than materializing the whole SIMPLE_KEYS
+        # defaults block — Minecraft fills in every unset key with its own
+        # default on first boot anyway, and pre-writing them would pin
+        # this panel's guesses (e.g. difficulty) over MC's actual defaults.
+        current = {}
     current.update(updates)
     lines = [f"{k}={v}" for k, v in current.items()]
     paths.properties_file.write_text("\n".join(lines) + "\n")
     return current
+
+
+def remove_property(paths: ServerPaths, key: str) -> None:
+    """Drops a single key from server.properties (used to clear
+    level-seed so Minecraft generates a fresh random seed). No-op when
+    the file or key doesn't exist."""
+    if not paths.properties_file.exists():
+        return
+    current = read_properties(paths)
+    if key not in current:
+        return
+    del current[key]
+    lines = [f"{k}={v}" for k, v in current.items()]
+    paths.properties_file.write_text("\n".join(lines) + "\n")
