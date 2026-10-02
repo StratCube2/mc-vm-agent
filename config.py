@@ -69,6 +69,10 @@ class ServerPaths:
         self.downloads_dir = self.root / ".downloads"
         self.run_script = self.root / "run.sh"
         self.server_jar = self.root / "server.jar"
+        # Fabric: thin launcher stub (~600 bytes) that loads the real
+        # vanilla server.jar sitting next to it. Never replace server.jar
+        # with this — it must be launched directly instead.
+        self.fabric_launch_jar = self.root / "fabric-server-launch.jar"
         self.pumpkin_bin = self.root / "pumpkin_server"
         self.meta_file = self.root / "meta.json"  # name, loader, mc_version
 

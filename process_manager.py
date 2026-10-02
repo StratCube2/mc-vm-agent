@@ -97,6 +97,10 @@ class _ServerProcess:
             if java != "java":
                 env_prefix = ["env", f"PATH={Path(java).parent}:" + os.environ.get("PATH", "")]
             return env_prefix + ["bash", str(p.run_script), "nogui"]
+        # Fabric: run the launcher stub, which finds the real vanilla
+        # server.jar (and libraries/) beside it.
+        if p.fabric_launch_jar.exists():
+            return [java, f"-Xmx{xmx}", f"-Xms{xms}", "-jar", str(p.fabric_launch_jar), "nogui"]
         if p.server_jar.exists():
             return [java, f"-Xmx{xmx}", f"-Xms{xms}", "-jar", str(p.server_jar), "nogui"]
         raise FileNotFoundError(

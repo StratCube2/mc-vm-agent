@@ -170,6 +170,20 @@ async def _download(url: str, dest: Path) -> Path:
     return dest
 
 
+def _is_real_server_jar(path: Path) -> bool:
+    """A vanilla server.jar is a regular file of many MB. The Fabric
+    launcher stub (a symlink target, ~600 bytes) must not pass for one."""
+    try:
+        if path.is_symlink() or not path.is_file():
+            return False
+        if path.stat().st_size < 1_000_000:
+            return False
+        with open(path, "rb") as f:
+            return f.read(2) == b"PK"
+    except OSError:
+        return False
+
+
 def _assert_valid_jar(path: Path) -> None:
     """A failed/partial/HTML-error download can pass the HTTP status
     check and still not be a real jar. Jars are zip files, which always
@@ -240,6 +254,15 @@ async def install_vanilla(paths: ServerPaths, mc_version: str) -> None:
     Resolves the URL from the gist first; if the gist is unreachable or
     doesn't list the version, falls back to Mojang's own version manifest."""
     paths.ensure_dirs()
+    # A leftover Fabric launcher would take priority over server.jar at
+    # launch time (process_manager), so switching to vanilla must drop it.
+    paths.fabric_launch_jar.unlink(missing_ok=True)
+    await _install_vanilla_jar(paths, mc_version)
+
+
+async def _install_vanilla_jar(paths: ServerPaths, mc_version: str) -> None:
+    """Puts the real vanilla server jar at paths.server_jar (gist first,
+    Mojang manifest fallback). Shared by vanilla and Fabric installs."""
     try:
         await _install_vanilla_from_gist(paths, mc_version)
         return
@@ -313,6 +336,12 @@ async def install_fabric(paths: ServerPaths, mc_version: str, loader_version: st
     installer_jar = await _download(installer_url, paths.downloads_dir / "fabric-installer.jar")
     _assert_valid_jar(installer_jar)
 
+    # Clear anything a previous (buggy or different-loader) install left at
+    # server.jar — e.g. a symlink to the launcher stub — so the installer
+    # downloads a fresh vanilla jar instead of trusting a bad file.
+    paths.server_jar.unlink(missing_ok=True)
+    paths.run_script.unlink(missing_ok=True)
+
     result = subprocess.run(
         [
             "java", "-jar", str(installer_jar),
@@ -329,29 +358,34 @@ async def install_fabric(paths: ServerPaths, mc_version: str, loader_version: st
     if result.returncode != 0:
         raise InstallError(f"Fabric install failed:\n{result.stderr[-2000:]}")
 
-    launch_jar = paths.root / "fabric-server-launch.jar"
+    launch_jar = paths.fabric_launch_jar
     if not launch_jar.exists():
         raise InstallError("Fabric install completed but launch jar not found")
 
-    # The launch jar is a thin wrapper — it needs the actual vanilla
-    # server jar (fetched via -downloadMinecraft) plus libraries/ next
-    # to it. If those are missing, the launch jar runs but throws
-    # exactly the "game provider couldn't locate the game" error you're
-    # debugging, with a successful-looking installer exit code.
+    # fabric-server-launch.jar is only a ~600-byte stub. It looks for the
+    # REAL vanilla server.jar next to it plus libraries/, and the server is
+    # started by running the stub directly (see process_manager). The old
+    # code symlinked server.jar -> the stub, which overwrote the vanilla
+    # jar the installer had just downloaded and made Fabric find "itself"
+    # as the game: "Minecraft game provider couldn't locate the game!".
     libraries_dir = paths.root / "libraries"
     if not libraries_dir.exists() or not any(libraries_dir.rglob("*.jar")):
         raise InstallError(
             "Fabric install completed but libraries/ is missing or empty — "
-            "the installer likely failed to download Minecraft itself "
-            "(check network access to launchermeta.mojang.com / "
-            "piston-data.mojang.com from the VM)"
+            "the installer likely failed to download its libraries "
+            "(check network access to maven.fabricmc.net from the VM)"
         )
-    # unlink(missing_ok=True) removes a regular file OR a broken symlink;
-    # server_jar.exists() would return False for a broken symlink (it
-    # follows the link to check the target), silently skipping removal
-    # and causing symlink_to() below to raise FileExistsError.
-    paths.server_jar.unlink(missing_ok=True)
-    paths.server_jar.symlink_to(launch_jar)
+
+    # If -downloadMinecraft didn't leave a real vanilla jar (blocked/failed
+    # download), fetch it ourselves via the gist/manifest path.
+    if not _is_real_server_jar(paths.server_jar):
+        logger.warning("fabric install: no valid server.jar after installer, fetching vanilla jar")
+        await _install_vanilla_jar(paths, mc_version)
+    if not _is_real_server_jar(paths.server_jar):
+        raise InstallError(
+            "Fabric install finished but server.jar is missing or is not the "
+            "vanilla Minecraft jar"
+        )
 
 
 async def install_paper(paths: ServerPaths, mc_version: str) -> None:
@@ -359,6 +393,7 @@ async def install_paper(paths: ServerPaths, mc_version: str) -> None:
     into server.jar via PaperMC's Fill v3 API — no installer step,
     same launch shape as vanilla (plain `java -jar server.jar`)."""
     paths.ensure_dirs()
+    paths.fabric_launch_jar.unlink(missing_ok=True)
     headers = {"User-Agent": PAPER_USER_AGENT}
 
     async with httpx.AsyncClient(timeout=15, headers=headers) as client:
