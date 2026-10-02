@@ -16,8 +16,10 @@ All JVM-based installers are run with the VM's system Java, so Java
 itself must already be present (handled by the VM provisioning
 cloud-init, not here). Pumpkin needs no Java at all.
 """
+import hashlib
 import httpx
 import logging
+import re
 import subprocess
 import stat
 from pathlib import Path
@@ -44,6 +46,26 @@ PAPER_USER_AGENT = "PulseHost-mc-vm-agent/1.0 (+https://pulshost.netlify.app)"
 # so the Linux x64 asset is the only one ever relevant here.
 PUMPKIN_NIGHTLY_ASSET_URL = (
     "https://github.com/Pumpkin-MC/Pumpkin/releases/download/nightly/pumpkin-X64-Linux"
+)
+
+
+# Vanilla server jar URLs are looked up in this community-maintained gist
+# first (a markdown table: version | server jar URL | client jar URL).
+# The embed URL (...js) only renders HTML for web pages — the agent needs
+# the raw markdown, which GitHub serves from gist.githubusercontent.com
+# (no filename in the path = latest revision of the gist's first file).
+VANILLA_GIST_RAW_URL = (
+    "https://gist.githubusercontent.com/cliffano/"
+    "77a982a7503669c3e1acb0a0cf6127e9/raw/"
+)
+# Only jars hosted by Mojang are ever downloaded from a gist-provided URL.
+# The gist is third-party and editable by its owner, so this is the guard
+# against it ever pointing the VM at an arbitrary host.
+_MOJANG_JAR_URL_RE = re.compile(
+    r"^https://piston-data\.mojang\.com/v1/objects/([0-9a-f]{40})/server\.jar$"
+)
+_GIST_ROW_RE = re.compile(
+    r"^\|\s*([^|\s]+)\s*\|\s*(https://\S+?/server\.jar)\s*\|", re.MULTILINE
 )
 
 
@@ -161,7 +183,75 @@ def _assert_valid_jar(path: Path) -> None:
         )
 
 
+def _parse_gist_table(markdown: str) -> dict[str, str]:
+    """Parses the gist's markdown table into {mc_version: server_jar_url}.
+    Rows whose URL isn't a Mojang piston-data server.jar are dropped."""
+    out: dict[str, str] = {}
+    for version, url in _GIST_ROW_RE.findall(markdown):
+        if _MOJANG_JAR_URL_RE.match(url):
+            out[version] = url
+    return out
+
+
+async def _fetch_gist_versions() -> dict[str, str]:
+    async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+        r = await client.get(VANILLA_GIST_RAW_URL)
+        r.raise_for_status()
+    table = _parse_gist_table(r.text)
+    if not table:
+        raise InstallError("Vanilla jar gist contained no usable server.jar rows")
+    return table
+
+
+def _sha1_of(path: Path) -> str:
+    h = hashlib.sha1()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+async def _install_vanilla_from_gist(paths: ServerPaths, mc_version: str) -> None:
+    table = await _fetch_gist_versions()
+    url = table.get(mc_version)
+    if url is None:
+        raise InstallError(f"Minecraft {mc_version} is not listed in the vanilla jar gist")
+    expected_sha1 = _MOJANG_JAR_URL_RE.match(url).group(1)
+    logger.info("vanilla install (gist): %s -> %s", mc_version, url)
+
+    paths.server_jar.unlink(missing_ok=True)
+    await _download(url, paths.server_jar)
+
+    # Mojang's object URLs are content-addressed: the path segment IS the
+    # jar's SHA-1, so the download can be verified with no extra metadata.
+    actual_sha1 = _sha1_of(paths.server_jar)
+    if actual_sha1 != expected_sha1:
+        paths.server_jar.unlink(missing_ok=True)
+        raise InstallError(
+            f"server.jar SHA-1 mismatch for {mc_version}: got {actual_sha1}, "
+            f"expected {expected_sha1} (corrupt or intercepted download)"
+        )
+    _assert_valid_jar(paths.server_jar)
+
+
 async def install_vanilla(paths: ServerPaths, mc_version: str) -> None:
+    """Installs the vanilla server jar for mc_version into server.jar on
+    this VM (the agent runs on the VM, so downloading here IS the upload).
+    Resolves the URL from the gist first; if the gist is unreachable or
+    doesn't list the version, falls back to Mojang's own version manifest."""
+    paths.ensure_dirs()
+    try:
+        await _install_vanilla_from_gist(paths, mc_version)
+        return
+    except (InstallError, httpx.HTTPError) as e:
+        logger.warning(
+            "vanilla install via gist failed for %s (%s) — falling back to Mojang manifest",
+            mc_version, e,
+        )
+    await _install_vanilla_from_manifest(paths, mc_version)
+
+
+async def _install_vanilla_from_manifest(paths: ServerPaths, mc_version: str) -> None:
     """Downloads the official Mojang server jar for mc_version straight
     into server.jar — no installer step needed for vanilla."""
     paths.ensure_dirs()
