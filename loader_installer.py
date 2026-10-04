@@ -49,7 +49,8 @@ PUMPKIN_NIGHTLY_ASSET_URL = (
 )
 
 
-# Vanilla server jar URLs are looked up first in this JSON gist:
+# Vanilla server jar URLs are used as a fallback when Mojang's manifest
+# download produces a broken jar:
 #   [{"version": "26.3", "server": "<jar url>", "client": "<jar url>"}, ...]
 # The URL has no revision hash on purpose, so GitHub always serves the
 # gist's latest revision — new versions added to the gist are picked up
@@ -69,6 +70,10 @@ _MOJANG_JAR_URL_RE = re.compile(
 
 class InstallError(Exception):
     pass
+
+
+class BrokenJarError(InstallError):
+    """The downloaded artifact was present but failed jar validation."""
 
 
 async def list_mc_versions(release_only: bool = True) -> list[str]:
@@ -176,7 +181,7 @@ def _assert_valid_jar(path: Path) -> None:
     with open(path, "rb") as f:
         header = f.read(2)
     if header != b"PK":
-        raise InstallError(
+        raise BrokenJarError(
             f"{path.name} does not look like a valid jar (bad download?)"
         )
 
@@ -243,8 +248,8 @@ async def _install_vanilla_from_gist(paths: ServerPaths, mc_version: str) -> Non
 async def install_vanilla(paths: ServerPaths, mc_version: str) -> None:
     """Installs the vanilla server jar for mc_version into server.jar on
     this VM (the agent runs on the VM, so downloading here IS the upload).
-    Resolves the URL from the gist first; if the gist is unreachable or
-    doesn't list the version, falls back to Mojang's own version manifest."""
+    Resolves the URL from Mojang's own version manifest first, then uses
+    the gist only if the downloaded jar fails validation."""
     paths.ensure_dirs()
     # A leftover Fabric launcher would take priority over server.jar at
     # launch time (process_manager), so switching to vanilla must drop it.
@@ -253,17 +258,22 @@ async def install_vanilla(paths: ServerPaths, mc_version: str) -> None:
 
 
 async def _install_vanilla_jar(paths: ServerPaths, mc_version: str) -> None:
-    """Puts the real vanilla server jar at paths.server_jar (gist first,
-    Mojang manifest fallback). Shared by vanilla and Fabric installs."""
+    """Puts the real vanilla server jar at paths.server_jar.
+
+    Mojang's manifest is the source of truth. The gist is retained as a
+    recovery path for a broken artifact, such as a truncated or invalid
+    jar returned by the manifest's download URL.
+    """
     try:
-        await _install_vanilla_from_gist(paths, mc_version)
+        await _install_vanilla_from_manifest(paths, mc_version)
         return
-    except (InstallError, httpx.HTTPError) as e:
+    except BrokenJarError as e:
         logger.warning(
-            "vanilla install via gist failed for %s (%s) — falling back to Mojang manifest",
+            "vanilla install via Mojang manifest produced a broken jar for %s "
+            "(%s) — falling back to gist",
             mc_version, e,
         )
-    await _install_vanilla_from_manifest(paths, mc_version)
+    await _install_vanilla_from_gist(paths, mc_version)
 
 
 async def _install_vanilla_from_manifest(paths: ServerPaths, mc_version: str) -> None:
@@ -288,14 +298,21 @@ async def _install_vanilla_from_manifest(paths: ServerPaths, mc_version: str) ->
     )
 
     paths.server_jar.unlink(missing_ok=True)
-    await _download(server_download["url"], paths.server_jar)
+    try:
+        await _download(server_download["url"], paths.server_jar)
+    except InstallError as e:
+        # The manifest resolved successfully, but its artifact could not be
+        # obtained as a usable jar. Give the gist a chance to recover it.
+        raise BrokenJarError(
+            f"could not download a usable server.jar from Mojang: {e}"
+        ) from e
 
     actual_size = paths.server_jar.stat().st_size
     expected_size = server_download.get("size")
     if expected_size and actual_size != expected_size:
         bad_bytes = paths.server_jar.read_bytes()[:500]
         paths.server_jar.unlink(missing_ok=True)
-        raise InstallError(
+        raise BrokenJarError(
             f"server.jar size mismatch: got {actual_size} bytes, "
             f"Mojang manifest says it should be {expected_size} bytes. "
             f"This means the download was intercepted or truncated "
@@ -368,7 +385,7 @@ async def install_fabric(paths: ServerPaths, mc_version: str, loader_version: st
         )
 
     # Fabric's launcher needs the real vanilla server.jar beside it. Fetch
-    # it from the gist (Mojang manifest as fallback) rather than letting
+    # it from Mojang's manifest (gist fallback) rather than letting
     # the installer download it (-downloadMinecraft is deliberately not
     # passed). SHA-1 verified against the Mojang URL.
     await _install_vanilla_jar(paths, mc_version)
