@@ -24,7 +24,7 @@ import subprocess
 import stat
 from pathlib import Path
 
-from config import ServerPaths
+from config import ServerPaths, is_real_server_jar as _is_real_server_jar
 
 logger = logging.getLogger(__name__)
 
@@ -49,23 +49,21 @@ PUMPKIN_NIGHTLY_ASSET_URL = (
 )
 
 
-# Vanilla server jar URLs are looked up in this community-maintained gist
-# first (a markdown table: version | server jar URL | client jar URL).
-# The embed URL (...js) only renders HTML for web pages — the agent needs
-# the raw markdown, which GitHub serves from gist.githubusercontent.com
-# (no filename in the path = latest revision of the gist's first file).
-VANILLA_GIST_RAW_URL = (
-    "https://gist.githubusercontent.com/cliffano/"
-    "77a982a7503669c3e1acb0a0cf6127e9/raw/"
+# Vanilla server jar URLs are looked up first in this JSON gist:
+#   [{"version": "26.3", "server": "<jar url>", "client": "<jar url>"}, ...]
+# The URL has no revision hash on purpose, so GitHub always serves the
+# gist's latest revision — new versions added to the gist are picked up
+# without redeploying the agent to every VM. (GitHub's raw CDN caches for
+# a few minutes.)
+VANILLA_VERSIONS_JSON_URL = (
+    "https://gist.githubusercontent.com/StratCube2/"
+    "ba249a1a6de1d0058f8b7aaacdec9ced/raw/Minecraft-versions-serverjar.json"
 )
-# Only jars hosted by Mojang are ever downloaded from a gist-provided URL.
-# The gist is third-party and editable by its owner, so this is the guard
-# against it ever pointing the VM at an arbitrary host.
+# Only jars hosted by Mojang are ever downloaded from a gist-provided URL
+# (guards against a bad edit pointing the VM at an arbitrary host). Newer
+# versions live on piston-data.mojang.com, older ones on launcher.mojang.com.
 _MOJANG_JAR_URL_RE = re.compile(
-    r"^https://piston-data\.mojang\.com/v1/objects/([0-9a-f]{40})/server\.jar$"
-)
-_GIST_ROW_RE = re.compile(
-    r"^\|\s*([^|\s]+)\s*\|\s*(https://\S+?/server\.jar)\s*\|", re.MULTILINE
+    r"^https://(?:piston-data|launcher)\.mojang\.com/v1/objects/([0-9a-f]{40})/server\.jar$"
 )
 
 
@@ -170,20 +168,6 @@ async def _download(url: str, dest: Path) -> Path:
     return dest
 
 
-def _is_real_server_jar(path: Path) -> bool:
-    """A vanilla server.jar is a regular file of many MB. The Fabric
-    launcher stub (a symlink target, ~600 bytes) must not pass for one."""
-    try:
-        if path.is_symlink() or not path.is_file():
-            return False
-        if path.stat().st_size < 1_000_000:
-            return False
-        with open(path, "rb") as f:
-            return f.read(2) == b"PK"
-    except OSError:
-        return False
-
-
 def _assert_valid_jar(path: Path) -> None:
     """A failed/partial/HTML-error download can pass the HTTP status
     check and still not be a real jar. Jars are zip files, which always
@@ -197,23 +181,31 @@ def _assert_valid_jar(path: Path) -> None:
         )
 
 
-def _parse_gist_table(markdown: str) -> dict[str, str]:
-    """Parses the gist's markdown table into {mc_version: server_jar_url}.
-    Rows whose URL isn't a Mojang piston-data server.jar are dropped."""
+def _parse_versions_json(data) -> dict[str, str]:
+    """Parses the gist's JSON list into {mc_version: server_jar_url}.
+    Entries without a Mojang-hosted server.jar URL are dropped."""
+    if not isinstance(data, list):
+        raise InstallError("Vanilla versions JSON must be a list of entries")
     out: dict[str, str] = {}
-    for version, url in _GIST_ROW_RE.findall(markdown):
-        if _MOJANG_JAR_URL_RE.match(url):
+    for entry in data:
+        if not isinstance(entry, dict):
+            continue
+        version, url = entry.get("version"), entry.get("server")
+        if isinstance(version, str) and isinstance(url, str) and _MOJANG_JAR_URL_RE.match(url):
             out[version] = url
     return out
 
 
 async def _fetch_gist_versions() -> dict[str, str]:
     async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
-        r = await client.get(VANILLA_GIST_RAW_URL)
+        r = await client.get(VANILLA_VERSIONS_JSON_URL)
         r.raise_for_status()
-    table = _parse_gist_table(r.text)
+    try:
+        table = _parse_versions_json(r.json())
+    except ValueError as e:  # malformed JSON
+        raise InstallError(f"Vanilla versions JSON is not valid JSON: {e}")
     if not table:
-        raise InstallError("Vanilla jar gist contained no usable server.jar rows")
+        raise InstallError("Vanilla versions JSON contained no usable server.jar entries")
     return table
 
 
@@ -349,7 +341,6 @@ async def install_fabric(paths: ServerPaths, mc_version: str, loader_version: st
             "-mcversion", mc_version,
             "-loader", loader_version,
             "-dir", str(paths.root),
-            "-downloadMinecraft",
         ],
         cwd=str(paths.root),
         capture_output=True,
@@ -376,11 +367,11 @@ async def install_fabric(paths: ServerPaths, mc_version: str, loader_version: st
             "(check network access to maven.fabricmc.net from the VM)"
         )
 
-    # If -downloadMinecraft didn't leave a real vanilla jar (blocked/failed
-    # download), fetch it ourselves via the gist/manifest path.
-    if not _is_real_server_jar(paths.server_jar):
-        logger.warning("fabric install: no valid server.jar after installer, fetching vanilla jar")
-        await _install_vanilla_jar(paths, mc_version)
+    # Fabric's launcher needs the real vanilla server.jar beside it. Fetch
+    # it from the gist (Mojang manifest as fallback) rather than letting
+    # the installer download it (-downloadMinecraft is deliberately not
+    # passed). SHA-1 verified against the Mojang URL.
+    await _install_vanilla_jar(paths, mc_version)
     if not _is_real_server_jar(paths.server_jar):
         raise InstallError(
             "Fabric install finished but server.jar is missing or is not the "

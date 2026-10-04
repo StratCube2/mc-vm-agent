@@ -19,7 +19,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Optional
 
-from config import ServerPaths, MAX_CONCURRENT_SERVERS, java_binary_for
+from config import ServerPaths, MAX_CONCURRENT_SERVERS, java_binary_for, is_real_server_jar
 
 
 class ServerState(str, Enum):
@@ -100,6 +100,12 @@ class _ServerProcess:
         # Fabric: run the launcher stub, which finds the real vanilla
         # server.jar (and libraries/) beside it.
         if p.fabric_launch_jar.exists():
+            if not is_real_server_jar(p.server_jar):
+                raise FileNotFoundError(
+                    "This Fabric server has no valid vanilla server.jar (a previous "
+                    "install replaced it with the launcher stub). Reinstall the loader "
+                    "(POST /servers/{id}/install/loader) to repair it."
+                )
             return [java, f"-Xmx{xmx}", f"-Xms{xms}", "-jar", str(p.fabric_launch_jar), "nogui"]
         if p.server_jar.exists():
             return [java, f"-Xmx{xmx}", f"-Xms{xms}", "-jar", str(p.server_jar), "nogui"]

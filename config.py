@@ -136,3 +136,17 @@ def java_binary_for(mc_version: str | None) -> str:
                         return candidate
                     break
     return "java"
+
+
+def is_real_server_jar(path: Path) -> bool:
+    """A vanilla server.jar is a regular file of many MB. The Fabric
+    launcher stub (~600 bytes), or a symlink to it, must not pass."""
+    try:
+        if path.is_symlink() or not path.is_file():
+            return False
+        if path.stat().st_size < 1_000_000:
+            return False
+        with open(path, "rb") as f:
+            return f.read(2) == b"PK"
+    except OSError:
+        return False
